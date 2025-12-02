@@ -1,501 +1,536 @@
 #!/usr/bin/env bash
-# esp-build.sh - Speechster Build System V3 (entrypoint)
-# Place at firmware repo root. It bootstraps and executes the modular engine.
-# Verbose by default; use --quiet to disable.
+# esp-build.sh - Speechster Build System V4 (single-file, Level 3)
+# One-file build manager: interactive OR fully flag-driven CI mode.
+# Verbose by default. Use --quiet to disable (or export SPEECHSTER_VERBOSE=0).
+#
+# Quick examples:
+#  ./esp-build.sh                          -> interactive (verbose)
+#  ./esp-build.sh --track A --version 10.3 --env F --stability s --change + --parent A9.1 --commit-msg "msg"
+#  ./esp-build.sh --auto --auto-parent --no-flash --no-commit --quiet   -> fully automated dry CI flow
+#
+# Requirements: bash, git, idf.py (ESP-IDF in PATH), coreutils, awk, sed
+# Place at firmware repo root. Make executable: chmod +x esp-build.sh
 set -euo pipefail
 
 # -------------------------
-# ARG / ENV handling
+# Defaults & env
 # -------------------------
-VERBOSE=1
-QUIET_FLAG=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --quiet|-q) VERBOSE=0; QUIET_FLAG=1; shift ;;
-    --help|-h) echo "Usage: $0 [--quiet]"; exit 0 ;;
-    *) shift ;;
-  esac
-done
-export SPEECHSTER_VERBOSE=${SPEECHSTER_VERBOSE:-$VERBOSE}
-
-# -------------------------
-# paths
-# -------------------------
+SPEECHSTER_VERBOSE=${SPEECHSTER_VERBOSE:-1}   # default verbose on
+QUIET=0
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENGINE_DIR="${ROOT_DIR}/speechster-build"
 HISTORY_FILE="${ROOT_DIR}/build_history.txt"
 CONFIG_FILE="${ROOT_DIR}/.speechster.conf"
+DEFAULT_PORT="/dev/ttyACM0"
+DEFAULT_ENV="F"
+DEFAULT_TRACK="A"
+SERIES_STRATEGY="major"   # major-branch strategy (A10, A11, B1, ...)
+UNSAFE_MODE=0             # --dangerous
+DRY_RUN=0                 # --dry
+NO_FLASH=0
+NO_MONITOR=0
+NO_COMMIT=0
+AUTO_MODE=0               # --auto (auto version + parent if possible)
+AUTO_SUGGEST=0            # --auto-suggest (suggest version, still prompts unless --auto)
+AUTO_PARENT=0             # --auto-parent (fill parent from last history)
+FORCE_YES=0               # --yes to accept prompts
+PORT="${DEFAULT_PORT}"
+USE_UNICODE_PARENTS=1     # if 0, use <<A9.1>>
+SPINNER_PID=0
 
 # -------------------------
-# ensure bash
+# ANSI colors & small helpers
 # -------------------------
-if [ -z "${BASH_VERSION-}" ]; then
-  echo "Please use bash to run this script."
-  exit 1
-fi
+GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
+timestamp(){ date "+%Y-%m-%d %H:%M:%S"; }
+
+ok(){ if [ "${SPEECHSTER_VERBOSE}" -eq 1 ]; then printf "${GREEN}[OK]${RESET} %s\n" "$*"; else printf "[OK] %s\n" "$*"; fi; }
+info(){ if [ "${SPEECHSTER_VERBOSE}" -eq 1 ]; then printf "${CYAN}[INFO]${RESET} %s\n" "$*"; else printf "[INFO] %s\n" "$*"; fi; }
+warn(){ if [ "${SPEECHSTER_VERBOSE}" -eq 1 ]; then printf "${YELLOW}[WARN]${RESET} %s\n" "$*"; else printf "[WARN] %s\n" "$*"; fi; }
+err(){ if [ "${SPEECHSTER_VERBOSE}" -eq 1 ]; then printf "${RED}[ERR]${RESET} %s\n" "$*"; else printf "[ERR] %s\n" "$*"; fi; }
+
+die(){ err "$*"; exit 1; }
 
 # -------------------------
-# BOOTSTRAP: create engine files if missing
+# Usage
 # -------------------------
-bootstrap_engine() {
-  if [ ! -d "$ENGINE_DIR" ]; then
-    echo "[bootstrap] engine not found, creating structure..."
-    mkdir -p "$ENGINE_DIR"
-    # create placeholder files from here (they will get overwritten by the following file dumps)
-  fi
+usage(){
+cat <<EOF
+Usage: $0 [options]
 
-  # If module files are missing, write them.
-  # We assume the caller has copied the modules below into speechster-build/.
-  # If they don't exist, try to write them from here using heredocs.
-  local missing=0
-  for f in core.sh git-manager.sh versioning.sh logging.sh colors.sh config.sh environment.sh fail-safe.sh; do
-    if [ ! -f "${ENGINE_DIR}/${f}" ]; then
-      missing=1
-    fi
-  done
+Level-3 (CI) capable flags:
+  --track <A|B|R>            Track (A/B/R)
+  --version <major.minor>    Version (eg 10.3)
+  --env <F|W|B|T|M>         Environment (Firmware/Web/Backend/Tools/Multi)
+  --stability <s|t|e|p|d|x>  Stability (s=stable,t=test,e=experimental,p=prototype,d=debug,x=broken)
+  --change <+|*|%|!|~|=|?>   Change type (+ feature, * modify, % perf, ! breaking, ~ minor, = meta, ? misc)
+  --parent <A9.1>           Parent build (optional)
+  --no-parent               Explicitly no parent
+  --port /dev/ttyXXX        Serial port for idf.py (default ${DEFAULT_PORT})
 
-  if [ "$missing" -eq 1 ]; then
-    echo "[bootstrap] Missing modules detected. Auto-creating modules..."
-    # write modules here (the rest of the files will be created by this script when copying)
-    cat > "${ENGINE_DIR}/colors.sh" <<'EOF'
-#!/usr/bin/env bash
-# colors.sh - ANSI color helpers
-GREEN="\e[32m"
-RED="\e[31m"
-YELLOW="\e[33m"
-CYAN="\e[36m"
-BOLD="\e[1m"
-RESET="\e[0m"
+Automation & CI:
+  --auto                    Full auto (auto-version + auto-parent + minimal prompts)
+  --auto-suggest            Suggest next version (still prompts)
+  --auto-parent             Fill parent from last build if available
+  --commit-msg "message"    Commit message to use (auto if absent)
+  --no-commit               Do not git commit
+  --no-flash                Build only, do not flash
+  --no-monitor              Build + flash, but no monitor
+  --dry                     Dry-run: no git/idf actions; prints actions
+  --dangerous               Allow risky ops without prompts (use carefully)
+  --yes                     Answer yes to confirmation prompts
+  --quiet, -q               Quiet mode (no verbose logs)
+  --help, -h                Show this help
 
-ok() { if [ "${SPEECHSTER_VERBOSE:-1}" -eq 1 ]; then echo -e "${GREEN}[OK]${RESET} $*"; else echo "[OK] $*"; fi }
-info() { if [ "${SPEECHSTER_VERBOSE:-1}" -eq 1 ]; then echo -e "${CYAN}[INFO]${RESET} $*"; else echo "[INFO] $*"; fi }
-warn() { if [ "${SPEECHSTER_VERBOSE:-1}" -eq 1 ]; then echo -e "${YELLOW}[WARN]${RESET} $*"; else echo "[WARN] $*"; fi }
-err()  { if [ "${SPEECHSTER_VERBOSE:-1}" -eq 1 ]; then echo -e "${RED}[ERR]${RESET} $*"; else echo "[ERR] $*"; fi }
+Examples:
+  $0 --track A --version 10.3 --env F --stability s --change + --parent A9.1
+  $0 --auto --env F --change + --commit-msg "Auto build" --no-flash
+
 EOF
+}
 
-    cat > "${ENGINE_DIR}/logging.sh" <<'EOF'
-#!/usr/bin/env bash
-# logging.sh - verbose logging utilities
+# -------------------------
+# CLI parse
+# -------------------------
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h) usage; exit 0;;
+    --quiet|-q) SPEECHSTER_VERBOSE=0; QUIET=1; shift;;
+    --dry) DRY_RUN=1; shift;;
+    --dangerous) UNSAFE_MODE=1; shift;;
+    --auto) AUTO_MODE=1; AUTO_SUGGEST=1; AUTO_PARENT=1; shift;;
+    --auto-suggest) AUTO_SUGGEST=1; shift;;
+    --auto-parent) AUTO_PARENT=1; shift;;
+    --no-flash) NO_FLASH=1; shift;;
+    --no-monitor) NO_MONITOR=1; shift;;
+    --no-commit) NO_COMMIT=1; shift;;
+    --yes) FORCE_YES=1; shift;;
+    --track) TRACK="$2"; shift 2;;
+    --version) VERSION="$2"; shift 2;;
+    --env) ENVIRONMENT="$2"; shift 2;;
+    --stability) STABILITY="$2"; shift 2;;
+    --change) CHANGETYPE="$2"; shift 2;;
+    --parent) PARENT="$2"; shift 2;;
+    --no-parent) PARENT=""; shift;;
+    --port) PORT="$2"; shift 2;;
+    --commit-msg) COMMIT_MSG="$2"; shift 2;;
+    -t) TRACK="$2"; shift 2;;
+    -v) VERSION="$2"; shift 2;;
+    -e) ENVIRONMENT="$2"; shift 2;;
+    -s) STABILITY="$2"; shift 2;;
+    -c) CHANGETYPE="$2"; shift 2;;
+    -P) PARENT="$2"; shift 2;;
+    *) ARGS+=("$1"); shift;;
+  esac
+done
 
-log_debug() {
-  if [ "${SPEECHSTER_VERBOSE:-1}" -eq 1 ]; then
-    local t=$(date "+%Y-%m-%d %H:%M:%S")
-    echo -e "[DEBUG] ${t} $*"
+# -------------------------
+# utility functions
+# -------------------------
+is_valid_track(){ [[ "$1" =~ ^[ABR]$ ]]; }
+is_valid_version(){ [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+is_valid_env(){ [[ "$1" =~ ^(F|W|B|T|M)$ ]]; }
+is_valid_stability(){ [[ "$1" =~ ^(s|t|e|p|d|x)$ ]]; }
+is_valid_change(){ [[ "$1" =~ ^(\+|\*|%|!|~|=|\?)$ ]]; }
+
+# safe echo of parent with chosen bracket style
+parent_bracketed(){ local p="$1"; if [ "${USE_UNICODE_PARENTS}" -eq 1 ]; then printf "⟪%s⟫" "$p"; else printf "<<%s>>" "$p"; fi }
+
+# spinner (lightweight)
+spinner_start(){
+  if [ "${SPEECHSTER_VERBOSE}" -eq 1 ]; then
+    ( while :; do for c in '/-\|'; do printf "\r[BUILD] %s " "$c"; sleep 0.08; done; done ) &
+    SPINNER_PID=$!
+    disown
   fi
 }
-
-log_info() {
-  local t=$(date "+%Y-%m-%d %H:%M:%S")
-  echo -e "[INFO] ${t} $*"
+spinner_stop(){
+  if [ "${SPINNER_PID}" -ne 0 ] 2>/dev/null; then kill "$SPINNER_PID" 2>/dev/null || true; SPINNER_PID=0; printf "\r"; fi
 }
 
-log_warn() {
-  local t=$(date "+%Y-%m-%d %H:%M:%S")
-  echo -e "[WARN] ${t} $*"
-}
-
-log_error() {
-  local t=$(date "+%Y-%m-%d %H:%M:%S")
-  echo -e "[ERROR] ${t} $*"
-}
-EOF
-
-    cat > "${ENGINE_DIR}/config.sh" <<'EOF'
-#!/usr/bin/env bash
-# config.sh - loads/saves .speechster.conf defaults
-
-load_config() {
-  # default values
-  DEFAULT_ENV="${DEFAULT_ENV:-F}"
-  DEFAULT_PORT="${DEFAULT_PORT:-/dev/ttyACM0}"
+# -------------------------
+# History & config helpers
+# -------------------------
+load_defaults_and_config(){
+  # defaults
+  DEFAULT_ENV="${DEFAULT_ENV:-${DEFAULT_ENV}}"
+  DEFAULT_PORT="${DEFAULT_PORT:-${PORT:-/dev/ttyACM0}}"
   DEFAULT_TRACK="${DEFAULT_TRACK:-A}"
-  HISTORY_FILE="${HISTORY_FILE:-build_history.txt}"
   SERIES_STRATEGY="${SERIES_STRATEGY:-major}"
-  if [ -f ".speechster.conf" ]; then
-    # shell-safe sourcing
-    source .speechster.conf
-  fi
-}
-save_default_config() {
-  cat > .speechster.conf <<EOF
-# speechster default config (auto-generated)
-DEFAULT_ENV="${DEFAULT_ENV}"
-DEFAULT_PORT="${DEFAULT_PORT}"
-DEFAULT_TRACK="${DEFAULT_TRACK}"
-SERIES_STRATEGY="${SERIES_STRATEGY}"
-}
-EOF
-
-    cat > "${ENGINE_DIR}/environment.sh" <<'EOF'
-#!/usr/bin/env bash
-# environment.sh - environment helpers
-
-get_verbose_flag() {
-  echo "${SPEECHSTER_VERBOSE:-1}"
-}
-EOF
-
-    cat > "${ENGINE_DIR}/fail-safe.sh" <<'EOF'
-#!/usr/bin/env bash
-# fail-safe.sh - snapshot & rollback helpers
-
-# Usage:
-# fs_snapshot "desc" => returns variable SNAPSHOT_HASH and SNAPSHOT_BRANCH
-# fs_rollback => roll back to snapshot
-SNAPSHOT_BRANCH=""
-SNAPSHOT_HASH=""
-
-fs_snapshot() {
-  SNAPSHOT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "no-branch")
-  SNAPSHOT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "")
-  echo "[snapshot] branch=${SNAPSHOT_BRANCH} hash=${SNAPSHOT_HASH}"
+  [ -f "${CONFIG_FILE}" ] && source "${CONFIG_FILE}" || true
+  # normalize
+  PORT="${PORT:-${DEFAULT_PORT}}"
 }
 
-fs_rollback() {
-  if [ -n "${SNAPSHOT_HASH}" ]; then
-    echo "[rollback] resetting to ${SNAPSHOT_HASH} on branch ${SNAPSHOT_BRANCH}"
-    git reset --hard "${SNAPSHOT_HASH}" || true
-    git checkout "${SNAPSHOT_BRANCH}" || true
-  else
-    echo "[rollback] no snapshot available"
-  fi
-}
-EOF
-
-    cat > "${ENGINE_DIR}/versioning.sh" <<'EOF'
-#!/usr/bin/env bash
-# versioning.sh - helpers for version parsing, suggestion, and validation
-
-# validate version format major.minor
-is_valid_version() {
-  [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]
-}
-
-suggest_next_version() {
+suggest_next_version(){
   local last="$1"
-  if [ -z "$last" ]; then
-    echo "1.0"
-    return
-  fi
-  # remove leading track char if present
+  [ -z "$last" ] && echo "1.0" && return
   last="${last#[A-Za-z]}"
-  if ! is_valid_version "$last"; then
-    echo "1.0"
-    return
-  fi
+  if ! is_valid_version "$last"; then echo "1.0"; return; fi
   IFS='.' read -r major minor <<< "$last"
   minor=${minor:-0}
   minor=$((minor + 1))
   echo "${major}.${minor}"
 }
 
-make_version_tag() {
-  local track="$1"
-  local version="$2"
-  local environment="$3"
-  local stability="$4"
-  local changetype="$5"
-  local parent="$6"
-  if [ -z "${parent}" ]; then
-    echo "${track}${version}[${environment}|${stability}|${changetype}]"
-  else
-    echo "${track}${version}[${environment}|${stability}|${changetype}]::⟪${parent}⟫"
-  fi
-}
-EOF
-
-    cat > "${ENGINE_DIR}/git-manager.sh" <<'EOF'
-#!/usr/bin/env bash
-# git-manager.sh - branch and git operations
-
-# Checks if branch exists locally
-git_branch_exists() {
-  git show-ref --verify --quiet "refs/heads/$1"
-  return $?
+get_last_history_line(){
+  [ -f "${HISTORY_FILE}" ] && tail -n 1 "${HISTORY_FILE}" || echo ""
 }
 
-# Create and checkout branch
-git_checkout_or_create_branch() {
-  local branch="$1"
-  if git_branch_exists "$branch"; then
-    log_debug "[git] checkout $branch"
-    git checkout "$branch"
-  else
-    log_debug "[git] create branch $branch from main"
-    git checkout -b "$branch" main
-  fi
+extract_parent_from_history(){
+  # expects history line like: "2025-12-05 13:02 A10.3[F|s|+]::⟪A9.1⟫ commit=abc"
+  local line="$1"
+  if [[ "$line" =~ ⟪([A-Za-z0-9_.-]+)⟫ ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  if [[ "$line" =~ <<([A-Za-z0-9_.-]+)>> ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  echo ""
 }
 
-# Create tag
-git_tag_build() {
-  local tag="$1"
-  local message="$2"
-  git tag -a "$tag" -m "$message" || true
-}
-
-# Safe commit wrapper
-git_safe_commit() {
-  local msg="$1"
-  git add -A
-  git commit -m "$msg" || true
-}
-
-# Merge helper
-git_merge_branch_into() {
-  local src="$1"
-  local dst="$2"
-  git checkout "$dst"
-  git merge --ff-only "$src" 2>/dev/null || git merge "$src"
-}
-
-# show current branch and head
-git_current_branch() {
-  git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "no-branch"
-}
-EOF
-
-    cat > "${ENGINE_DIR}/core.sh" <<'EOF'
-#!/usr/bin/env bash
-# core.sh - orchestrator
-
-# load helpers
-source "${ENGINE_DIR}/colors.sh"
-source "${ENGINE_DIR}/logging.sh"
-source "${ENGINE_DIR}/config.sh"
-source "${ENGINE_DIR}/environment.sh"
-source "${ENGINE_DIR}/fail-safe.sh"
-source "${ENGINE_DIR}/versioning.sh"
-source "${ENGINE_DIR}/git-manager.sh"
-
-load_config
-
-# ensure git initialized if requested
-ensure_git_initialized() {
+# -------------------------
+# bootstrap if empty repo
+# -------------------------
+bootstrap_if_needed(){
   if [ ! -d .git ]; then
-    log_info "No git repo found. Initializing..."
+    info "No git repo found. Bootstrapping..."
     git init
+    # create minimal files so repo isn't empty
+    mkdir -p main components docs || true
+    echo "# Speechster Firmware - bootstrap" > README.md
     git add .
-    git remote add origin https://github.com/SpeechsterInnovations/Speechster-Firmware.git
-    git commit -m "Init Commit" || true
+    git commit -m "Initial commit (speechster bootstrap)" || true
     git branch -M main || true
+    ok "Bootstrapped git repo with main branch."
   fi
   # ensure main exists
   if ! git show-ref --verify --quiet refs/heads/main; then
     git checkout -b main || true
   fi
+  # ensure history file exists
+  touch "${HISTORY_FILE}"
 }
 
-# append history
-append_history() {
-  local entry="$1"
-  echo "$entry" >> "${HISTORY_FILE}"
+# -------------------------
+# git snapshot & rollback
+# -------------------------
+SNAPSHOT_BRANCH=""
+SNAPSHOT_HASH=""
+make_snapshot(){
+  SNAPSHOT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "no-branch")
+  SNAPSHOT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "")
+  info "Snapshot saved: branch=${SNAPSHOT_BRANCH} hash=${SNAPSHOT_HASH}"
 }
-
-# parse last history parent
-get_last_parent() {
-  if [ -f "${HISTORY_FILE}" ]; then
-    tail -n 1 "${HISTORY_FILE}" | awk '{print $2,$3,$4,$5;}' | awk '{print $2}' 2>/dev/null || echo ""
+rollback_snapshot(){
+  if [ -n "$SNAPSHOT_HASH" ]; then
+    warn "Rolling back to snapshot ${SNAPSHOT_HASH} on ${SNAPSHOT_BRANCH}"
+    git reset --hard "${SNAPSHOT_HASH}" || true
+    git checkout "${SNAPSHOT_BRANCH}" || true
   else
-    echo ""
+    warn "No snapshot to roll back to."
   fi
 }
 
-# main flow
-run_build_flow() {
-  # interactive prompts
-  local suggested=""
-  if [ -f "${HISTORY_FILE}" ]; then
-    lastline=$(tail -n1 "${HISTORY_FILE}")
-    suggested=$(echo "${lastline}" | awk '{print $2}' | sed 's/^[A-Za-z]//' ) 2>/dev/null || true
+# -------------------------
+# git helpers
+# -------------------------
+git_branch_exists(){ git show-ref --verify --quiet "refs/heads/$1"; return $?; }
+git_checkout_or_create_branch(){
+  local branch="$1"
+  if git_branch_exists "$branch"; then
+    info "[git] checkout $branch"
+    git checkout "$branch"
+  else
+    info "[git] create branch $branch from main"
+    git checkout -b "$branch" main
   fi
+}
+git_safe_commit(){
+  local msg="$1"
+  if [ "${DRY_RUN}" -eq 1 ]; then info "[dry] git add/commit -m \"$msg\""; return; fi
+  git add -A
+  git commit -m "$msg" || info "[git] commit returned non-zero (maybe nothing to commit)"
+}
+git_tag_build(){
+  local tag="$1"; local message="$2"
+  if [ "${DRY_RUN}" -eq 1 ]; then info "[dry] git tag -a $tag -m \"$message\""; return; fi
+  git tag -a "$tag" -m "$message" || info "[git] tag may already exist"
+}
+git_merge_branch_into(){
+  local src="$1"; local dst="$2"
+  if [ "${DRY_RUN}" -eq 1 ]; then info "[dry] git checkout $dst && git merge $src"; return; fi
+  git checkout "$dst"
+  # prefer fast-forward
+  if git merge --ff-only "$src" 2>/dev/null; then
+    info "Fast-forwarded $dst with $src"
+  else
+    git merge "$src" || { err "Merge failed"; return 1; }
+  fi
+}
+git_get_short_hash(){ git rev-parse --short HEAD 2>/dev/null || echo "no-hash"; }
 
+# -------------------------
+# version tag composition & validation
+# -------------------------
+make_version_tag(){
+  local track="$1"; local version="$2"; local env="$3"; local stab="$4"; local ch="$5"; local parent="$6"
+  if [ -z "$parent" ]; then
+    printf "%s%s[%s|%s|%s]" "$track" "$version" "$env" "$stab" "$ch"
+  else
+    printf "%s%s[%s|%s|%s]::%s" "$track" "$version" "$env" "$stab" "$ch" "$(parent_bracketed "$parent")"
+  fi
+}
+
+# -------------------------
+# interactive helpers
+# -------------------------
+confirm_or_die(){
+  local prompt="$1"
+  if [ "${FORCE_YES}" -eq 1 ]; then return 0; fi
+  read -p "$prompt (Y/n): " ans
+  ans=${ans:-Y}
+  if [[ ! "$ans" =~ ^[Yy] ]]; then die "User aborted"; fi
+}
+
+# -------------------------
+# auto-suggestions & parent filling
+# -------------------------
+last_history_line=$(get_last_history_line)
+LAST_VERSION_FROM_HISTORY=""
+if [ -n "$last_history_line" ]; then
+  # parse like: "2025-12-05 13:02 A10.3[F|s|+]::⟪A9.1⟫ commit=abc"
+  if [[ "$last_history_line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+    # extract second field
+    LVER="$(echo "$last_history_line" | awk '{print $3}')"
+    LAST_VERSION_FROM_HISTORY="$LVER"
+  fi
+fi
+
+if [ "${AUTO_PARENT}" -eq 1 ] && [ -n "${LAST_VERSION_FROM_HISTORY}" ]; then
+  auto_parent_candidate="$(extract_parent_from_history "${last_history_line}")"
+  [ -n "$auto_parent_candidate" ] && info "Auto-parent filled from history: $auto_parent_candidate"
+  PARENT="${PARENT:-$auto_parent_candidate}"
+fi
+
+# -------------------------
+# Interactive prompts (if flags missing)
+# -------------------------
+# prompt for missing values (interactive unless fully automated with flags)
+if [ -z "${TRACK:-}" ]; then
   read -p "Track (A/B/R) [${DEFAULT_TRACK}]: " TRACK
   TRACK=${TRACK:-$DEFAULT_TRACK}
-  if [ -n "${suggested}" ]; then
-    next_ver=$(suggest_next_version "${suggested}")
-    read -p "Version (e.g. ${next_ver}): " VERSION
-    VERSION=${VERSION:-$next_ver}
-  else
-    read -p "Version (e.g. 1.0): " VERSION
-  fi
+fi
+if ! is_valid_track "$TRACK"; then die "Invalid track: $TRACK"; fi
 
+if [ -z "${VERSION:-}" ]; then
+  if [ -n "${LAST_VERSION_FROM_HISTORY}" ] && [ "${AUTO_SUGGEST}" -eq 1 ]; then
+    suggested_next=$(suggest_next_version "${LAST_VERSION_FROM_HISTORY}")
+    read -p "Version (e.g. ${suggested_next}): " VERSION
+    VERSION=${VERSION:-$suggested_next}
+  else
+    read -p "Version (e.g. 10.3): " VERSION
+  fi
+fi
+if ! is_valid_version "$VERSION"; then die "Invalid version format: $VERSION"; fi
+
+if [ -z "${ENVIRONMENT:-}" ]; then
   read -p "Environment (F/W/B/T/M) [${DEFAULT_ENV}]: " ENVIRONMENT
   ENVIRONMENT=${ENVIRONMENT:-$DEFAULT_ENV}
+fi
+if ! is_valid_env "$ENVIRONMENT"; then die "Invalid environment: $ENVIRONMENT"; fi
+
+if [ -z "${STABILITY:-}" ]; then
   read -p "Stability (s/t/e/p/d/x) [t]: " STABILITY
   STABILITY=${STABILITY:-t}
+fi
+if ! is_valid_stability "$STABILITY"; then die "Invalid stability: $STABILITY"; fi
+
+if [ -z "${CHANGETYPE:-}" ]; then
   read -p "Change Type (+/*/%/!/~/=/?): " CHANGETYPE
+fi
+if ! is_valid_change "${CHANGETYPE}"; then die "Invalid change type: ${CHANGETYPE}"; fi
+
+# parent: if explicitly set to empty by user, we honor it; else prompt
+if [ -z "${PARENT:-}" ] && [ "${AUTO_PARENT}" -eq 0 ] && [ "${AUTO_MODE}" -eq 0 ]; then
   read -p "Parent (leave empty if none): " PARENT
+fi
 
-  # validate basics
-  if ! is_valid_version "${VERSION}"; then
-    log_error "Invalid version format. Expected major.minor (e.g. 10.3)."
-    exit 1
-  fi
+# -------------------------
+# Compose tag and pre-checks
+# -------------------------
+VERSION_TAG="$(make_version_tag "$TRACK" "$VERSION" "$ENVIRONMENT" "$STABILITY" "$CHANGETYPE" "${PARENT:-}")"
+info "Generated version tag: ${VERSION_TAG}"
+echo "${VERSION_TAG}" > "${ROOT_DIR}/build_version.txt"
 
-  VERSION_TAG=$(make_version_tag "${TRACK}" "${VERSION}" "${ENVIRONMENT}" "${STABILITY}" "${CHANGETYPE}" "${PARENT}")
+# bootstrap repo if needed
+bootstrap_if_needed
 
-  log_info "Generated version tag: ${VERSION_TAG}"
-  echo "${VERSION_TAG}" > build_version.txt
+# prepare major branch name A10 from version like 10.3
+MAJOR_BRANCH="${TRACK}$(echo "${VERSION}" | cut -d. -f1)"
+info "Target major branch: ${MAJOR_BRANCH}"
 
-  # pre-flight git init/bootstrapping
-  ensure_git_initialized
+# safety: if parent is set, compute parent branch
+if [ -n "${PARENT:-}" ]; then
+  PARENT_TRACK=$(echo "${PARENT}" | sed 's/^\([A-Za-z]\).*$/\1/')
+  PARENT_MAJOR=$(echo "${PARENT}" | sed 's/^[A-Za-z]//;s/\..*$//')
+  PARENT_BRANCH="${PARENT_TRACK}${PARENT_MAJOR}"
+  info "Parent branch resolved to ${PARENT_BRANCH}"
+fi
 
-  # branch handling (major-branch strategy)
-  MAJOR_BRANCH="${TRACK}$(echo "${VERSION}" | cut -d. -f1)"
-  log_debug "Major branch: ${MAJOR_BRANCH}"
+# -------------------------
+# Snapshot
+# -------------------------
+make_snapshot
 
-  fs_snapshot
-
-  # ensure parent branch exists (if given)
-  if [ -n "${PARENT}" ]; then
-    PARENT_MAJOR=$(echo "${PARENT}" | sed 's/^[A-Za-z]//;s/\..*$//')
-    PARENT_TRACK=$(echo "${PARENT}" | sed 's/\([A-Za-z]\).*/\1/')
-    PARENT_BRANCH="${PARENT_TRACK}${PARENT_MAJOR}"
-    if ! git_branch_exists "${PARENT_BRANCH}"; then
-      log_warn "Parent branch ${PARENT_BRANCH} not found locally."
-      read -p "Create parent branch ${PARENT_BRANCH} from main? (y/n): " cpar
-      if [[ "${cpar}" =~ ^[Yy]$ ]]; then
-        git checkout -b "${PARENT_BRANCH}" main
-        git_safe_commit "bootstrap parent branch ${PARENT_BRANCH}"
-      else
-        log_warn "Proceeding without creating parent branch. Be sure parent exists remotely."
-      fi
-    fi
-  fi
-
-  # cross-track warning
-  if [ -n "${PARENT}" ]; then
-    PARENT_TRACK_ONLY=$(echo "${PARENT}" | sed 's/[^A-Za-z].*//')
-    if [ "${PARENT_TRACK_ONLY}" != "${TRACK}" ]; then
-      read -p "Warning: cross-track build (building ${TRACK} based on ${PARENT_TRACK_ONLY}). Continue? (Y/n): " crossok
-      if [[ ! "${crossok}" =~ ^[Yy]$ ]]; then
-        log_info "User aborted due to cross-track selection."
-        fs_rollback
-        exit 1
-      fi
-    fi
-  fi
-
-  # checkout or create major branch
-  git_checkout_or_create_branch "${MAJOR_BRANCH}"
-
-  # if parent exists and is newer -> ask to merge
-  if [ -n "${PARENT}" ] && git_branch_exists "${PARENT_BRANCH}"; then
-    # check if parent has commits ahead of current branch
-    ahead=$(git rev-list --count "${MAJOR_BRANCH}..${PARENT_BRANCH}" 2>/dev/null || echo 0)
-    if [ "${ahead}" -gt 0 ]; then
-      read -p "Parent branch ${PARENT_BRANCH} is ahead of ${MAJOR_BRANCH}. Merge ${PARENT_BRANCH} -> ${MAJOR_BRANCH} before build? (Y/n): " mergok
-      if [[ "${mergok}" =~ ^[Yy]$ ]]; then
-        log_info "Merging ${PARENT_BRANCH} into ${MAJOR_BRANCH}..."
-        git merge "${PARENT_BRANCH}" || { log_error "Merge conflict. Rolling back."; fs_rollback; exit 1; }
-      else
-        log_info "User declined merge. Proceeding without merging."
-      fi
-    fi
-  fi
-
-  # commit pending changes (optional)
-  read -p "Commit working tree before build? (y/n) [y]: " DO_COMMIT
-  DO_COMMIT=${DO_COMMIT:-y}
-  if [[ "${DO_COMMIT}" =~ ^[Yy] ]]; then
-    read -p "Commit message (empty = auto): " CM
-    if [ -z "${CM}" ]; then
-      CM="Build ${VERSION_TAG}"
-    fi
-    git_safe_commit "${CM}"
-    HASH=$(git rev-parse --short HEAD || echo "no-hash")
-  else
-    HASH="no-commit"
-  fi
-
-  # write to history
-  DATE_NOW=$(date "+%Y-%m-%d %H:%M")
-  echo "${DATE_NOW} ${VERSION_TAG} commit=${HASH}" >> "${HISTORY_FILE}"
-
-  # run the IDF build
-  echo "[build] Running: idf.py -p ${DEFAULT_PORT} build flash monitor"
-  idf.py -p "${DEFAULT_PORT}" build flash monitor
-  BUILD_EXIT=$?
-  if [ ${BUILD_EXIT} -ne 0 ]; then
-    log_error "Build failed. Rolling back."
-    fs_rollback
-    exit 1
-  fi
-
-  log_info "Build succeeded for ${VERSION_TAG}"
-
-  # tag on success
-  TAG="v${TRACK}${VERSION}"
-  git_tag_build "${TAG}" "Build ${VERSION_TAG}"
-  log_info "Tagged ${TAG}"
-
-  # stable merge to main prompt
-  if [ "${STABILITY}" = "s" ]; then
-    read -p "Build marked stable. Merge branch ${MAJOR_BRANCH} into main? (Y/n): " domerge
-    if [[ "${domerge}" =~ ^[Yy]$ ]]; then
-      fs_snapshot
-      git_merge_branch_into "${MAJOR_BRANCH}" "main" || { log_error "Merge failed. Rolling back."; fs_rollback; exit 1; }
-      git tag -a "${TAG}" -m "Release ${TAG}"
-      log_info "Merged ${MAJOR_BRANCH} -> main and tagged ${TAG}"
+# -------------------------
+# Ensure parent exists if given
+# -------------------------
+if [ -n "${PARENT:-}" ]; then
+  if ! git_branch_exists "${PARENT_BRANCH}"; then
+    warn "Parent branch ${PARENT_BRANCH} not found locally."
+    if [ "${UNSAFE_MODE}" -eq 1 ]; then
+      warn "--dangerous set: proceeding without creating parent branch"
     else
-      log_info "User declined merge to main."
+      if [ "${FORCE_YES}" -eq 1 ]; then
+        info "Auto-creating parent branch ${PARENT_BRANCH} from main"
+        git checkout -b "${PARENT_BRANCH}" main || true
+      else
+        read -p "Create parent branch ${PARENT_BRANCH} from main? (y/n): " cpar
+        if [[ "$cpar" =~ ^[Yy] ]]; then
+          git checkout -b "${PARENT_BRANCH}" main
+          git_safe_commit "bootstrap parent branch ${PARENT_BRANCH}"
+        else
+          warn "Proceeding without parent branch locally. Ensure remote exists when merging."
+        fi
+      fi
     fi
   fi
-
-  log_info "Build flow complete."
-}
-
-# if engine invoked directly, run
-if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
-  run_build_flow
 fi
-EOF
 
-    cat > "${ENGINE_DIR}/README.txt" <<'EOF'
-Speechster build engine modules - auto-created during bootstrap.
-Modules:
- - core.sh
- - git-manager.sh
- - versioning.sh
- - logging.sh
- - colors.sh
- - config.sh
- - environment.sh
- - fail-safe.sh
-EOF
-
-    chmod +x "${ENGINE_DIR}"/*.sh
-    echo "Modules created"
-  else
-    echo "All modules present"
+# -------------------------
+# Cross-track warning
+# -------------------------
+if [ -n "${PARENT:-}" ]; then
+  if [ "${PARENT_TRACK}" != "${TRACK}" ]; then
+    if [ "${UNSAFE_MODE}" -eq 1 ] || [ "${FORCE_YES}" -eq 1 ]; then
+      warn "Cross-track build detected but proceeding (--dangerous or --yes set)."
+    else
+      read -p "Warning: cross-track build (building ${TRACK} based on ${PARENT_TRACK}). Continue? (Y/n): " crossok
+      crossok=${crossok:-Y}
+      if [[ ! "$crossok" =~ ^[Yy] ]]; then rollback_snapshot; die "User aborted due to cross-track selection."; fi
+    fi
   fi
-}
-
-# -------------------------
-# Load modules (they will exist after bootstrap)
-# -------------------------
-bootstrap_engine
-
-# source engine modules
-source "${ENGINE_DIR}/colors.sh"
-source "${ENGINE_DIR}/logging.sh"
-source "${ENGINE_DIR}/config.sh"
-source "${ENGINE_DIR}/environment.sh"
-source "${ENGINE_DIR}/fail-safe.sh"
-source "${ENGINE_DIR}/versioning.sh"
-source "${ENGINE_DIR}/git-manager.sh"
-source "${ENGINE_DIR}/core.sh"
-
-# ensure defaults saved
-if [ ! -f "${CONFIG_FILE}" ]; then
-  DEFAULT_ENV="${DEFAULT_ENV:-F}"
-  DEFAULT_PORT="${DEFAULT_PORT:-/dev/ttyACM0}"
-  DEFAULT_TRACK="${DEFAULT_TRACK:-A}"
-  SERIES_STRATEGY="${SERIES_STRATEGY:-major}"
-  save_default_config
-  info "Default config created at .speechster.conf"
 fi
 
-# run the orchestrator
-run_build_flow
+# -------------------------
+# Checkout/create major branch
+# -------------------------
+git_checkout_or_create_branch "${MAJOR_BRANCH}"
 
+# -------------------------
+# If parent exists & has commits ahead -> ask to merge (unless forced)
+# -------------------------
+if [ -n "${PARENT_BRANCH:-}" ] && git_branch_exists "${PARENT_BRANCH}"; then
+  ahead=$(git rev-list --count "${MAJOR_BRANCH}..${PARENT_BRANCH}" 2>/dev/null || echo 0)
+  if [ "${ahead}" -gt 0 ]; then
+    if [ "${UNSAFE_MODE}" -eq 1 ] || [ "${FORCE_YES}" -eq 1 ]; then
+      info "Parent ${PARENT_BRANCH} ahead of ${MAJOR_BRANCH} - auto-merging (unsafe/yes)"
+      git merge "${PARENT_BRANCH}" || { err "Merge failed"; rollback_snapshot; exit 1; }
+    else
+      read -p "Parent ${PARENT_BRANCH} is ahead of ${MAJOR_BRANCH}. Merge ${PARENT_BRANCH} -> ${MAJOR_BRANCH} before build? (Y/n): " mergok
+      mergok=${mergok:-Y}
+      if [[ "$mergok" =~ ^[Yy] ]]; then
+        info "Merging ${PARENT_BRANCH} into ${MAJOR_BRANCH}..."
+        git merge "${PARENT_BRANCH}" || { err "Merge conflict. Rolling back."; rollback_snapshot; exit 1; }
+      else
+        info "User declined merge. Proceeding without merging."
+      fi
+    fi
+  fi
+fi
+
+# -------------------------
+# Commit working tree (unless user disables)
+# -------------------------
+if [ "${NO_COMMIT}" -eq 1 ]; then
+  info "--no-commit set: skipping commit"
+  HASH="no-commit"
+else
+  if [ -z "${COMMIT_MSG:-}" ]; then
+    COMMIT_MSG="Build ${VERSION_TAG}"
+  fi
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    info "[dry] would git commit -m \"$COMMIT_MSG\""
+    HASH="dry-run"
+  else
+    git_safe_commit "$COMMIT_MSG"
+    HASH="$(git_get_short_hash)"
+    ok "Committed, HEAD=${HASH}"
+  fi
+fi
+
+# -------------------------
+# Write to history
+# -------------------------
+DATE_NOW="$(timestamp)"
+echo "${DATE_NOW} ${VERSION_TAG} commit=${HASH}" >> "${HISTORY_FILE}"
+ok "Logged build to ${HISTORY_FILE}"
+
+# -------------------------
+# Run build (idf.py)
+# -------------------------
+if [ "${NO_FLASH}" -eq 1 ]; then
+  info "--no-flash set: running idf.py build only"
+  if [ "${DRY_RUN}" -eq 1 ]; then info "[dry] idf.py -p ${PORT} build"; else idf.py -p "${PORT}" build; fi
+else
+  info "Running: idf.py -p ${PORT} build flash monitor"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    info "[dry] would run: idf.py -p ${PORT} build flash monitor"
+  else
+    # spinner while building
+    spinner_start
+    set +e
+    idf.py -p "${PORT}" build flash monitor
+    BUILD_EXIT=$?
+    set -e
+    spinner_stop
+    if [ "${BUILD_EXIT}" -ne 0 ]; then
+      err "Build failed with exit code ${BUILD_EXIT}. Rolling back."
+      rollback_snapshot
+      exit 1
+    fi
+  fi
+fi
+
+ok "Build completed successfully for ${VERSION_TAG}"
+
+# -------------------------
+# Tag on success
+# -------------------------
+TAG="v${TRACK}${VERSION}"
+git_tag_build "${TAG}" "Build ${VERSION_TAG}"
+ok "Tagged ${TAG}"
+
+# -------------------------
+# Stable merge to main prompt (STABILITY == s)
+# -------------------------
+if [ "${STABILITY}" = "s" ]; then
+  if [ "${UNSAFE_MODE}" -eq 1 ] || [ "${FORCE_YES}" -eq 1 ]; then
+    info "Auto-merging ${MAJOR_BRANCH} into main (unsafe/yes)"
+    make_snapshot
+    git_merge_branch_into "${MAJOR_BRANCH}" "main" || { err "Merge failed. Rolling back."; rollback_snapshot; exit 1; }
+    git tag -a "${TAG}" -m "Release ${TAG}" || true
+    ok "Merged ${MAJOR_BRANCH} into main and tagged ${TAG}"
+  else
+    read -p "Build marked stable. Merge branch ${MAJOR_BRANCH} into main? (Y/n): " domerge
+    domerge=${domerge:-Y}
+    if [[ "$domerge" =~ ^[Yy] ]]; then
+      make_snapshot
+      git_merge_branch_into "${MAJOR_BRANCH}" "main" || { err "Merge failed. Rolling back."; rollback_snapshot; exit 1; }
+      git tag -a "${TAG}" -m "Release ${TAG}" || true
+      ok "Merged ${MAJOR_BRANCH} into main and tagged ${TAG}"
+    else
+      info "User declined merge to main."
+    fi
+  fi
+fi
+
+ok "Build flow complete. Version: ${VERSION_TAG}"
+exit 0
