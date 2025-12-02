@@ -155,6 +155,8 @@ run_build_flow() {
   DATE_NOW=$(date "+%Y-%m-%d %H:%M")
   echo "${DATE_NOW} ${VERSION_TAG} commit=${HASH}" >> "${HISTORY_FILE}"
 
+  # set origin
+  echo "Set Origin to: ${TRACK}${VERSION}"
   git push --set-upstream origin ${TRACK}${VERSION}
 
   # run the IDF build
