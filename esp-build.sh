@@ -181,7 +181,10 @@ extract_parent_from_history(){
   # expects history line like: "2025-12-05 13:02 A10.3[F|s|+]::⟪A9.1⟫ commit=abc"
   local line="$1"
   if [[ "$line" =~ ⟪([A-Za-z0-9_.-]+)⟫ ]]; then echo "${BASH_REMATCH[1]}"; return; fi
-  if [[ "$line" =~ <<([A-Za-z0-9_.-]+)>> ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  if [[ "$line" =~ \<\<([A-Za-z0-9_.-]+)\>\> ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
   echo ""
 }
 
