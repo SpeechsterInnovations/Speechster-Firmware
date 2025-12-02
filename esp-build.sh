@@ -36,6 +36,8 @@ FORCE_YES=0               # --yes to accept prompts
 PORT="${DEFAULT_PORT}"
 USE_UNICODE_PARENTS=1     # if 0, use <<A9.1>>
 SPINNER_PID=0
+NO_PARENT_FLAG=0
+NO_ROLLBACK=0
 
 # -------------------------
 # ANSI colors & small helpers
@@ -111,9 +113,10 @@ while [[ $# -gt 0 ]]; do
     --stability) STABILITY="$2"; shift 2;;
     --change) CHANGETYPE="$2"; shift 2;;
     --parent) PARENT="$2"; shift 2;;
-    --no-parent) PARENT=""; shift;;
+    --no-parent) PARENT=""; NO_PARENT_FLAG=1; shift;;
     --port) PORT="$2"; shift 2;;
     --commit-msg) COMMIT_MSG="$2"; shift 2;;
+    --no-rollback) NO_ROLLBACK=1; shift;;
     -t) TRACK="$2"; shift 2;;
     -v) VERSION="$2"; shift 2;;
     -e) ENVIRONMENT="$2"; shift 2;;
@@ -350,8 +353,11 @@ if [ -z "${CHANGETYPE:-}" ]; then
 fi
 if ! is_valid_change "${CHANGETYPE}"; then die "Invalid change type: ${CHANGETYPE}"; fi
 
-# parent: if explicitly set to empty by user, we honor it; else prompt
-if [ -z "${PARENT:-}" ] && [ "${AUTO_PARENT}" -eq 0 ] && [ "${AUTO_MODE}" -eq 0 ]; then
+# If user explicitly said --no-parent, never prompt.
+if [ "${NO_PARENT_FLAG:-0}" -eq 1 ]; then
+  PARENT=""
+# Otherwise prompt only if needed.
+elif [ -z "${PARENT:-}" ] && [ "${AUTO_PARENT}" -eq 0 ] && [ "${AUTO_MODE}" -eq 0 ]; then
   read -p "Parent (leave empty if none): " PARENT
 fi
 
@@ -417,7 +423,7 @@ if [ -n "${PARENT:-}" ]; then
     else
       read -p "Warning: cross-track build (building ${TRACK} based on ${PARENT_TRACK}). Continue? (Y/n): " crossok
       crossok=${crossok:-Y}
-      if [[ ! "$crossok" =~ ^[Yy] ]]; then rollback_snapshot; die "User aborted due to cross-track selection."; fi
+      if [[ ! "$crossok" =~ ^[Yy] ]]; then [ "${NO_ROLLBACK}" -eq 1 ] || rollback_snapshot; die "User aborted due to cross-track selection."; fi
     fi
   fi
 fi
@@ -435,13 +441,13 @@ if [ -n "${PARENT_BRANCH:-}" ] && git_branch_exists "${PARENT_BRANCH}"; then
   if [ "${ahead}" -gt 0 ]; then
     if [ "${UNSAFE_MODE}" -eq 1 ] || [ "${FORCE_YES}" -eq 1 ]; then
       info "Parent ${PARENT_BRANCH} ahead of ${MAJOR_BRANCH} - auto-merging (unsafe/yes)"
-      git merge "${PARENT_BRANCH}" || { err "Merge failed"; rollback_snapshot; exit 1; }
+      git merge "${PARENT_BRANCH}" || { err "Merge failed"; [ "${NO_ROLLBACK}" -eq 1 ] || rollback_snapshot; exit 1; }
     else
       read -p "Parent ${PARENT_BRANCH} is ahead of ${MAJOR_BRANCH}. Merge ${PARENT_BRANCH} -> ${MAJOR_BRANCH} before build? (Y/n): " mergok
       mergok=${mergok:-Y}
       if [[ "$mergok" =~ ^[Yy] ]]; then
         info "Merging ${PARENT_BRANCH} into ${MAJOR_BRANCH}..."
-        git merge "${PARENT_BRANCH}" || { err "Merge conflict. Rolling back."; rollback_snapshot; exit 1; }
+        git merge "${PARENT_BRANCH}" || { err "Merge conflict. Rolling back."; [ "${NO_ROLLBACK}" -eq 1 ] || rollback_snapshot; exit 1; }
       else
         info "User declined merge. Proceeding without merging."
       fi
@@ -496,7 +502,7 @@ else
     spinner_stop
     if [ "${BUILD_EXIT}" -ne 0 ]; then
       err "Build failed with exit code ${BUILD_EXIT}. Rolling back."
-      rollback_snapshot
+      [ "${NO_ROLLBACK}" -eq 1 ] || rollback_snapshot
       exit 1
     fi
   fi
@@ -518,7 +524,7 @@ if [ "${STABILITY}" = "s" ]; then
   if [ "${UNSAFE_MODE}" -eq 1 ] || [ "${FORCE_YES}" -eq 1 ]; then
     info "Auto-merging ${MAJOR_BRANCH} into main (unsafe/yes)"
     make_snapshot
-    git_merge_branch_into "${MAJOR_BRANCH}" "main" || { err "Merge failed. Rolling back."; rollback_snapshot; exit 1; }
+    git_merge_branch_into "${MAJOR_BRANCH}" "main" || { err "Merge failed. Rolling back."; [ "${NO_ROLLBACK}" -eq 1 ] || rollback_snapshot; exit 1; }
     git tag -a "${TAG}" -m "Release ${TAG}" || true
     ok "Merged ${MAJOR_BRANCH} into main and tagged ${TAG}"
   else
@@ -526,7 +532,7 @@ if [ "${STABILITY}" = "s" ]; then
     domerge=${domerge:-Y}
     if [[ "$domerge" =~ ^[Yy] ]]; then
       make_snapshot
-      git_merge_branch_into "${MAJOR_BRANCH}" "main" || { err "Merge failed. Rolling back."; rollback_snapshot; exit 1; }
+      git_merge_branch_into "${MAJOR_BRANCH}" "main" || { err "Merge failed. Rolling back."; [ "${NO_ROLLBACK}" -eq 1 ] || rollback_snapshot; exit 1; }
       git tag -a "${TAG}" -m "Release ${TAG}" || true
       ok "Merged ${MAJOR_BRANCH} into main and tagged ${TAG}"
     else
