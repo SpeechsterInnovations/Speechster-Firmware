@@ -181,13 +181,20 @@ get_last_history_line(){
 }
 
 extract_parent_from_history(){
-  # expects history line like: "2025-12-05 13:02 A10.3[F|s|+]::⟪A9.1⟫ commit=abc"
   local line="$1"
-  if [[ "$line" =~ ⟪([A-Za-z0-9_.-]+)⟫ ]]; then echo "${BASH_REMATCH[1]}"; return; fi
-  if [[ "$line" =~ \<\<([A-Za-z0-9_.-]+)\>\> ]]; then
+
+  # Unicode bracket (⟪ ⟫)
+  if [[ "$line" =~ ⟪([^⟫]+)⟫ ]]; then
     echo "${BASH_REMATCH[1]}"
     return
   fi
+
+  # ASCII bracket << >>
+  if [[ "$line" =~ \<\<([^>]+)\>\> ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+
   echo ""
 }
 
@@ -252,7 +259,7 @@ git_safe_commit(){
   local msg="$1"
   if [ "${DRY_RUN}" -eq 1 ]; then info "[dry] git add/commit -m \"$msg\""; return; fi
   git add -A
-  git commit -m "$msg" || info "[git] commit returned non-zero (maybe nothing to commit)"
+  git commit -a -m "$msg" || info "[git] commit returned non-zero (maybe nothing to commit)"
 }
 git_tag_build(){
   local tag="$1"; local message="$2"
@@ -516,6 +523,7 @@ ok "Build completed successfully for ${VERSION_TAG}"
 TAG="v${TRACK}${VERSION}"
 git_tag_build "${TAG}" "Build ${VERSION_TAG}"
 ok "Tagged ${TAG}"
+git_safe_commit()
 
 # -------------------------
 # Stable merge to main prompt (STABILITY == s)
